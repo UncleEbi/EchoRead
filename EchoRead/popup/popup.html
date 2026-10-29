@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EchoRead</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></symbol>
+    <symbol id="i-open" viewBox="0 0 24 24"><path d="M19 19H5V5h7V3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"/></symbol>
+  </svg>
+
+  <header class="app-header">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><rect width="24" height="24" rx="6" fill="currentColor"/><g fill="#fff"><rect x="5.5" y="9" width="2.4" height="6" rx="1.2"/><rect x="10.8" y="5.5" width="2.4" height="13" rx="1.2"/><rect x="16.1" y="8" width="2.4" height="8" rx="1.2"/></g></svg>
+      <h1>EchoRead</h1>
+    </div>
+    <p id="pageTitle" class="page-title" title=""></p>
+  </header>
+
+  <div class="tabs" role="tablist" aria-label="EchoRead sections">
+    <button class="tab" role="tab" id="tab-reader" aria-controls="panel-reader" aria-selected="true">Reader</button>
+    <button class="tab" role="tab" id="tab-highlights" aria-controls="panel-highlights" aria-selected="false" tabindex="-1">
+      Saved Highlights <span id="countBadge" class="badge" aria-label="highlights on this page">0</span>
+    </button>
+  </div>
+
+  <main>
+    <!-- READER -->
+    <section id="panel-reader" role="tabpanel" aria-labelledby="tab-reader" tabindex="0">
+      <div id="unsupported" class="notice" role="alert" hidden>
+        EchoRead can't run on this page (browser pages and the Chrome Web Store are restricted). Open a regular article to use the reader.
+      </div>
+
+      <div class="card">
+        <p id="status" class="status" role="status" aria-live="polite">Ready. Press Play to read this page aloud.</p>
+        <progress id="progress" max="100" value="0" aria-label="Reading progress"></progress>
+        <p id="preview" class="preview" aria-hidden="true"></p>
+
+        <div class="controls" role="group" aria-label="Playback controls">
+          <button id="btnPlay" class="ctl primary" type="button"><svg aria-hidden="true"><use href="#i-play"/></svg><span>Play</span></button>
+          <button id="btnPause" class="ctl" type="button" disabled><svg aria-hidden="true"><use href="#i-pause"/></svg><span>Pause</span></button>
+          <button id="btnResume" class="ctl" type="button" disabled><svg aria-hidden="true"><use href="#i-play"/></svg><span>Resume</span></button>
+          <button id="btnStop" class="ctl" type="button" disabled><svg aria-hidden="true"><use href="#i-stop"/></svg><span>Stop</span></button>
+        </div>
+      </div>
+
+      <div class="card settings">
+        <div class="field">
+          <label for="voice">Voice</label>
+          <select id="voice"><option value="">System default</option></select>
+          <p id="voiceHint" class="hint"></p>
+        </div>
+        <div class="field">
+          <div class="label-row"><label for="rate">Speed</label><output id="rateOut" for="rate">1.00×</output></div>
+          <input id="rate" type="range" min="0.75" max="2" step="0.05" value="1">
+        </div>
+        <div class="field">
+          <div class="label-row"><label for="pitch">Pitch</label><output id="pitchOut" for="pitch">1.0</output></div>
+          <input id="pitch" type="range" min="0.5" max="2" step="0.1" value="1">
+        </div>
+      </div>
+    </section>
+
+    <!-- HIGHLIGHTS -->
+    <section id="panel-highlights" role="tabpanel" aria-labelledby="tab-highlights" tabindex="0" hidden>
+      <div class="toolbar">
+        <div class="segmented" role="group" aria-label="Filter highlights">
+          <button id="scopePage" type="button" aria-pressed="true">This page</button>
+          <button id="scopeAll" type="button" aria-pressed="false">All saved clips</button>
+        </div>
+      </div>
+      <ul id="clipList" class="clip-list" aria-live="polite"></ul>
+      <p id="emptyState" class="empty" hidden></p>
+      <div class="export">
+        <button id="exportMd" class="btn" type="button"><svg aria-hidden="true"><use href="#i-download"/></svg>Export all (.md)</button>
+        <button id="exportJson" class="btn" type="button"><svg aria-hidden="true"><use href="#i-download"/></svg>Export all (.json)</button>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="popup.js"></script>
+</body>
+</html>
