@@ -17,10 +17,12 @@ Read any article aloud and save highlights from any webpage. Manifest V3, vanill
   using saved surrounding text to pick the right occurrence if the phrase appears more than once.
 - **Iframes**: highlighting works inside embedded frames and is saved under the top-level page.
 - **Context menu**: select text, right-click, "Save Highlight to EchoRead".
-- **Saved Highlights tab**: toggle "This page" / "All saved clips"; Copy, Delete, Go to page; export .md / .json.
+- **Saved Highlights tab**: toggle "This page" / "All saved clips"; Copy, Delete (Undo from the toast), Go to page; export .md / .json.
 - **Debug**: `chrome://extensions` > EchoRead > "service worker" for background logs; right-click popup > Inspect.
 
 ## Limitations
 - Cannot run on `chrome://` pages or the Chrome Web Store (a browser restriction).
 - The reader extracts article text from the top page only, not from inside iframes.
 - Highlights are re-found by text; if a page's wording changes, an old highlight may not re-appear (it stays in your saved list).
+- On pages that render text late (infinite scroll, late hydration), missing highlights are retried while the page
+  settles, for up to 30 seconds after load.

@@ -22,12 +22,22 @@ const pageKey = (url) => (url || '').split('#')[0];
 
 /* ---------------- helpers ---------------- */
 let toastTimer;
-function toast(msg) {
+function hideToast() {
+  clearTimeout(toastTimer);
+  $('toast').hidden = true;
+}
+function toast(msg, action = null) {
   const t = $('toast');
-  t.textContent = msg;
+  t.replaceChildren(h('span', { text: msg }));
+  if (action) {
+    t.appendChild(h('button', {
+      class: 'toast-btn', type: 'button', text: action.label,
+      onclick: () => { hideToast(); action.run(); },
+    }));
+  }
   t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, 1800);
+  toastTimer = setTimeout(hideToast, action ? 6000 : 1800); // undo needs time to be reachable
 }
 
 function h(tag, props = {}, ...children) {
@@ -114,9 +124,22 @@ function applyRelayResult(res) {
 async function saveSettings() {
   try { await chrome.storage.local.set({ [SETTINGS_KEY]: state.settings }); } catch (_) {}
 }
+// Sliders fire on every input event; coalesce so a drag is one write, not dozens.
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => { saveTimer = null; saveSettings(); }, 300);
+}
+function flushSave() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = null;
+  saveSettings();
+}
+window.addEventListener('pagehide', () => { if (saveTimer) flushSave(); });
+
 let liveTimer;
 function settingsChanged() {
-  saveSettings();
+  scheduleSave();
   if (state.tts.status === 'idle') return;
   clearTimeout(liveTimer);
   liveTimer = setTimeout(async () => applyRelayResult(await relay('TTS_SETTINGS', { settings: state.settings })), 250);
@@ -140,7 +163,11 @@ $('pitch').addEventListener('input', (e) => {
 $('voice').addEventListener('change', (e) => {
   state.settings.voiceURI = e.target.value;
   settingsChanged();
+  flushSave();
 });
+// Range inputs emit 'change' when the drag ends: persist without waiting for the timer.
+$('rate').addEventListener('change', flushSave);
+$('pitch').addEventListener('change', flushSave);
 
 function langName(code) {
   try { return new Intl.DisplayNames([navigator.language], { type: 'language' }).of(code) || code; } catch (_) { return code; }
@@ -180,6 +207,14 @@ const allItems = () => Object.values(state.groups).flatMap((g) => g.items || [])
 const latest = (g) => Math.max(0, ...(g.items || []).map((i) => Date.parse(i.timestamp) || 0));
 const fmtDate = (iso) => { try { return new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }); } catch (_) { return iso; } };
 
+// Deletes can be undone from the toast: re-saving the same item restores its id,
+// colour, timestamp and position in the list.
+async function restoreClip(item) {
+  let res = null;
+  try { res = await chrome.runtime.sendMessage({ type: 'SAVE_HIGHLIGHT', highlight: item }); } catch (_) {}
+  toast(res && res.ok ? 'Restored' : 'Could not restore');
+}
+
 async function copyText(text) {
   try { await navigator.clipboard.writeText(text); }
   catch (_) {
@@ -207,8 +242,10 @@ function clipNode(item) {
       h('button', {
         class: 'icon-btn danger', type: 'button', 'aria-label': 'Delete highlight',
         onclick: async () => {
-          const res = await chrome.runtime.sendMessage({ type: 'DELETE_HIGHLIGHT', url: item.url, id: item.id });
-          toast(res && res.ok ? 'Deleted' : 'Could not delete');
+          let res = null;
+          try { res = await chrome.runtime.sendMessage({ type: 'DELETE_HIGHLIGHT', url: item.url, id: item.id }); } catch (_) {}
+          if (!res || !res.ok) { toast('Could not delete'); return; }
+          toast('Deleted', { label: 'Undo', run: () => restoreClip(item) });
         },
       }, icon('i-trash'), 'Delete'),
       h('a', { class: 'icon-btn', href: item.url, target: '_blank', rel: 'noopener noreferrer', 'aria-label': `Go to page: ${item.pageTitle}` }, icon('i-open'), 'Go to page'),

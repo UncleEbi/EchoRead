@@ -97,5 +97,7 @@ input[type="range"] { width: 100%; margin: 8px 0 0; accent-color: var(--accent);
 .btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .btn:disabled { opacity: .4; cursor: not-allowed; }
 
-.toast { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); background: #111827; color: #fff; padding: 8px 14px; border-radius: 9px; font-size: 13px; box-shadow: 0 6px 20px rgba(0,0,0,.3); }
+.toast { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; background: #111827; color: #fff; padding: 8px 14px; border-radius: 9px; font-size: 13px; box-shadow: 0 6px 20px rgba(0,0,0,.3); }
+.toast-btn { background: none; border: 0; padding: 0; color: #a5b4fc; font: inherit; font-weight: 700; cursor: pointer; }
+.toast-btn:hover { color: #e0e7ff; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }

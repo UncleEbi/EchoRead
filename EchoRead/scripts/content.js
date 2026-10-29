@@ -4,8 +4,49 @@
  */
 (() => {
   'use strict';
-  if (window.__echoreadLoaded) return; // guard against double injection
+
+  const INSTANCE_ATTR = 'data-echoread-instance';
+  const ANSWER_ATTR = 'data-echoread-answer';
+  const PROBE_EVENT = 'echoread:probe';
+  const INSTANCE_ID = Math.random().toString(36).slice(2);
+
+  // Assigned once this copy has finished wiring itself up (see teardownFn below).
+  let teardownFn = null;
+
+  // A copy of this script outlives an extension reload as a zombie: its chrome.*
+  // APIs are dead, but its DOM listeners and UI are still live. A fresher copy asks
+  // the incumbent whether it is still attached to a live context, so a zombie steps
+  // aside instead of leaving the page permanently unreachable.
+  function contextAlive() {
+    try {
+      return !!(chrome.runtime && chrome.runtime.id && chrome.runtime.getManifest());
+    } catch (_) { return false; } // orphaned by a reload/update
+  }
+
+  function onProbe() {
+    const root = document.documentElement;
+    try {
+      if (contextAlive()) { root.setAttribute(ANSWER_ATTR, 'live'); return; }
+      if (teardownFn) teardownFn();
+    } catch (_) { /* a failing teardown must never block the fresh copy */ }
+    root.setAttribute(ANSWER_ATTR, 'dead');
+  }
+
+  function incumbentIsLive() {
+    const root = document.documentElement;
+    if (!root.hasAttribute(INSTANCE_ATTR)) return false;
+    try {
+      root.removeAttribute(ANSWER_ATTR); // drop the answer to an earlier probe
+      document.dispatchEvent(new CustomEvent(PROBE_EVENT));
+    } catch (_) { return false; }
+    return root.getAttribute(ANSWER_ATTR) === 'live';
+  }
+
+  // Guard against double injection – and take the page back from a zombie copy.
+  if (window.__echoreadLoaded || incumbentIsLive()) return;
   window.__echoreadLoaded = true;
+  document.documentElement.setAttribute(INSTANCE_ATTR, INSTANCE_ID);
+  document.addEventListener(PROBE_EVENT, onProbe);
 
   const STORE_KEY = 'echoread_highlights';
   const MARK_CLASS = 'echoread-highlight';
@@ -298,7 +339,8 @@
     else if (tts.status === 'paused') { tts.gen++; cancelSpeech(); tts.resumeNeedsSpeak = true; }
   }
 
-  window.addEventListener('pagehide', () => { if (tts.status !== 'idle') cancelSpeech(); });
+  const onPageHide = () => { if (tts.status !== 'idle') cancelSpeech(); };
+  window.addEventListener('pagehide', onPageHide);
 
   /* =====================================================================
    * HIGHLIGHT ENGINE
@@ -443,6 +485,52 @@
     return topInfo;
   }
 
+  /* Anchors that could not be placed yet (lazy-loaded feeds, late hydration).
+   * A single 2.5 s retry missed anything that rendered later, so keep watching the
+   * DOM briefly: mutations trigger a debounced retry, and a few timers cover pages
+   * that reveal text without structural changes. Both stop as soon as all fit. */
+  const RESTORE_RETRY_DELAYS = [1000, 2500, 6000, 12000];
+  const RESTORE_WATCH_MS = 30000;
+  let pendingAnchors = [];
+  let restoreObserver = null;
+  let observerDebounce = null;
+  let watchTimer = null;
+  let retryTimers = [];
+
+  function stopRestoreWatch() {
+    if (restoreObserver) restoreObserver.disconnect();
+    restoreObserver = null;
+    clearTimeout(observerDebounce);
+    clearTimeout(watchTimer);
+    retryTimers.forEach(clearTimeout);
+    retryTimers = [];
+    observerDebounce = null;
+    watchTimer = null;
+    pendingAnchors = [];
+  }
+
+  function retryPendingAnchors() {
+    if (!pendingAnchors.length) return stopRestoreWatch();
+    pendingAnchors = pendingAnchors.filter((h) => !applyHighlight(h));
+    if (!pendingAnchors.length) stopRestoreWatch();
+  }
+
+  function watchForLateContent(items) {
+    items.forEach((h) => {
+      if (!pendingAnchors.some((p) => p.id === h.id)) pendingAnchors.push(h);
+    });
+    if (!restoreObserver) {
+      restoreObserver = new MutationObserver(() => {
+        clearTimeout(observerDebounce);
+        observerDebounce = setTimeout(retryPendingAnchors, 500);
+      });
+      restoreObserver.observe(document.documentElement, { childList: true, subtree: true });
+      watchTimer = setTimeout(stopRestoreWatch, RESTORE_WATCH_MS);
+    }
+    retryTimers.forEach(clearTimeout);
+    retryTimers = RESTORE_RETRY_DELAYS.map((ms) => setTimeout(retryPendingAnchors, ms));
+  }
+
   async function restoreHighlights() {
     if (!IS_TOP && !topInfo && !(await ensureTopInfo())) return;
     try {
@@ -450,12 +538,12 @@
       const group = data[STORE_KEY] && data[STORE_KEY][pageKey()];
       if (!group) return;
       const failed = group.items.filter((h) => !applyHighlight(h));
-      if (failed.length) setTimeout(() => failed.forEach(applyHighlight), 2500); // late-rendering pages
+      if (failed.length) watchForLateContent(failed);
     } catch (_) {}
   }
 
   // Keep the DOM in sync with storage (deletes from popup, saves from other tabs).
-  chrome.storage.onChanged.addListener((changes, area) => {
+  function onStorageChanged(changes, area) {
     if (area !== 'local' || !changes[STORE_KEY]) return;
     if (!IS_TOP && !topInfo) return; // iframe hasn't learned its page key yet
     const all = changes[STORE_KEY].newValue || {};
@@ -466,8 +554,10 @@
       const id = m.dataset.echoreadId;
       if (!ids.has(id)) unwrapMark(m); else seen.add(id);
     });
-    items.forEach((h) => { if (!seen.has(h.id)) applyHighlight(h); });
-  });
+    const failed = items.filter((h) => !seen.has(h.id) && !applyHighlight(h));
+    if (failed.length) watchForLateContent(failed);
+  }
+  chrome.storage.onChanged.addListener(onStorageChanged);
 
   async function saveRange(range, color) {
     const raw = range.toString();
@@ -611,18 +701,22 @@
   }
 
   const fromUI = (e) => ui && e.composedPath().includes(ui.host);
-  document.addEventListener('mouseup', (e) => { if (!fromUI(e)) setTimeout(evaluateSelection, 10); }, true);
-  document.addEventListener('mousedown', (e) => { if (!fromUI(e)) hidePill(); }, true);
-  document.addEventListener('keyup', (e) => {
+  const onMouseUp = (e) => { if (!fromUI(e)) setTimeout(evaluateSelection, 10); };
+  const onMouseDown = (e) => { if (!fromUI(e)) hidePill(); };
+  const onKeyUp = (e) => {
     if (e.key === 'Escape') hidePill();
     else if (e.shiftKey || e.key === 'Shift') evaluateSelection();
-  }, true);
-  document.addEventListener('scroll', () => { if (pendingRange) hidePill(); }, { capture: true, passive: true });
+  };
+  const onScroll = () => { if (pendingRange) hidePill(); };
+  document.addEventListener('mouseup', onMouseUp, true);
+  document.addEventListener('mousedown', onMouseDown, true);
+  document.addEventListener('keyup', onKeyUp, true);
+  document.addEventListener('scroll', onScroll, { capture: true, passive: true });
 
   /* =====================================================================
    * MESSAGES (popup → background relay → here, and background → here)
    * ===================================================================== */
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  function onRuntimeMessage(msg, _sender, sendResponse) {
     switch (msg && msg.type) {
       case 'PING': sendResponse({ ok: true }); break;
       case 'GET_URL': if (IS_TOP) sendResponse({ ok: true, url: localKey(), title: document.title || location.hostname }); break;
@@ -647,7 +741,28 @@
       default: break;
     }
     return false;
-  });
+  }
+  chrome.runtime.onMessage.addListener(onRuntimeMessage);
+
+  // Detach every trace of this copy: keeps a zombie instance from drawing a second
+  // pill, double-handling selections, or re-applying highlights after it is orphaned.
+  teardownFn = () => {
+    document.removeEventListener(PROBE_EVENT, onProbe);
+    document.removeEventListener('mouseup', onMouseUp, true);
+    document.removeEventListener('mousedown', onMouseDown, true);
+    document.removeEventListener('keyup', onKeyUp, true);
+    document.removeEventListener('scroll', onScroll, true);
+    window.removeEventListener('pagehide', onPageHide);
+    try { chrome.runtime.onMessage.removeListener(onRuntimeMessage); } catch (_) {}
+    try { chrome.storage.onChanged.removeListener(onStorageChanged); } catch (_) {}
+    stopRestoreWatch();
+    stopReading(null, true); // in-page speech dies with this copy; the worker's voice is unreachable
+    if (ui && ui.host && ui.host.parentNode) ui.host.parentNode.removeChild(ui.host);
+    ui = null;
+    pendingRange = null;
+    document.documentElement.removeAttribute(INSTANCE_ATTR);
+    window.__echoreadLoaded = false;
+  };
 
   restoreHighlights();
 })();
