@@ -167,8 +167,12 @@ function populateVoices() {
     });
     sel.appendChild(group);
   });
-  sel.value = state.settings.voiceURI || '';
-  if (sel.value !== (state.settings.voiceURI || '')) sel.value = '';
+  const wanted = state.settings.voiceURI || '';
+  sel.value = wanted;
+  if (sel.value !== wanted) { // saved voice no longer exists on this system
+    sel.value = '';
+    state.settings.voiceURI = '';
+  }
 }
 
 /* ---------------- highlights UI ---------------- */

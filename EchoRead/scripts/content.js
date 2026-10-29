@@ -19,12 +19,13 @@
   let topInfo = null; // iframes: { url, title } of the top-level page, resolved through the background worker
   const pageKey = () => (IS_TOP || !topInfo ? localKey() : topInfo.url);
   const pageTitle = () => (IS_TOP || !topInfo ? document.title || location.hostname : topInfo.title);
-  const safeSend = (msg) => {
+  const sendToBG = (msg) => {
     try {
       const p = chrome.runtime.sendMessage(msg);
-      if (p && p.catch) p.catch(() => {});
-    } catch (_) { /* extension context invalidated */ }
+      return p && typeof p.then === 'function' ? p.catch(() => null) : Promise.resolve(null);
+    } catch (_) { return Promise.resolve(null); } // extension context invalidated
   };
+  const safeSend = (msg) => { sendToBG(msg); };
 
   /* =====================================================================
    * ARTICLE EXTRACTION
@@ -187,11 +188,26 @@
     stopReading(`Speech failed (${code || 'unknown error'}). Try another voice.`);
   }
 
+  // Chrome fills its voice list asynchronously, and getVoices() is often still
+  // empty the first time this script runs – without a cache the voice picked in
+  // the popup silently resolves to nothing and the default voice is used.
+  let voicesCache = [];
+  const loadVoices = () => { voicesCache = speechSynthesis.getVoices(); };
+  loadVoices();
+  // addEventListener so a page's own onvoiceschanged handler is left alone.
+  if (typeof speechSynthesis.addEventListener === 'function') speechSynthesis.addEventListener('voiceschanged', loadVoices);
+  else speechSynthesis.onvoiceschanged = loadVoices;
+  function resolveVoice() {
+    if (!tts.settings.voiceURI) return null;
+    const live = speechSynthesis.getVoices();
+    return (live.length ? live : voicesCache).find((v) => v.voiceURI === tts.settings.voiceURI) || null;
+  }
+
   // Chrome refuses page-level speech until the user has interacted with the page.
   // chrome.tts (in the background worker) has no such restriction, so fall back to it.
   function speakViaBackground(chunk, myGen) {
     tts.useBg = true;
-    const voice = tts.settings.voiceURI && speechSynthesis.getVoices().find((v) => v.voiceURI === tts.settings.voiceURI);
+    const voice = resolveVoice();
     safeSend({
       type: 'BG_SPEAK', gen: myGen, text: chunk.text,
       rate: tts.settings.rate, pitch: tts.settings.pitch,
@@ -210,7 +226,7 @@
     const u = new SpeechSynthesisUtterance(chunk.text);
     u.rate = tts.settings.rate;
     u.pitch = tts.settings.pitch;
-    const voice = tts.settings.voiceURI && speechSynthesis.getVoices().find((v) => v.voiceURI === tts.settings.voiceURI);
+    const voice = resolveVoice();
     if (voice) { u.voice = voice; u.lang = voice.lang; }
     u.onend = () => onChunkEnd(myGen);
     u.onerror = (e) => {
@@ -314,7 +330,9 @@
 
   function wrapRange(range, id, color) {
     const segs = collectSegments(range); // computed up-front: splitting mutates live ranges
-    if (!segs.length) return false;
+    // Bail out instead of throwing if the page re-rendered under us (SPA route
+    // change) and the captured range no longer sits in the document.
+    if (!segs.length || segs.some(({ node }) => !node.parentNode)) return false;
     for (const { node, s, e } of segs) {
       let target = node;
       if (e < node.nodeValue.length) node.splitText(e);
@@ -414,15 +432,19 @@
     return range ? wrapRange(range, h.id, h.color) : false;
   }
 
-  let topTries = 0;
-  async function restoreHighlights() {
-    if (!IS_TOP && !topInfo) {
-      try {
-        const r = await chrome.runtime.sendMessage({ type: 'GET_TOP_URL' });
-        if (r && r.ok) topInfo = { url: r.url, title: r.title };
-      } catch (_) {}
-      if (!topInfo) { if (++topTries < 4) setTimeout(restoreHighlights, 1500); return; }
+  // Iframes are filed under the top-level page, whose URL only the top frame
+  // knows; ask it, retrying while that frame's content script is still loading.
+  async function ensureTopInfo(tries = 4, delay = 1500) {
+    for (let i = 0; i < tries && !topInfo; i++) {
+      const r = await sendToBG({ type: 'GET_TOP_URL' });
+      if (r && r.ok && r.url) { topInfo = { url: r.url, title: r.title || r.url }; break; }
+      if (i < tries - 1) await new Promise((res) => setTimeout(res, delay));
     }
+    return topInfo;
+  }
+
+  async function restoreHighlights() {
+    if (!IS_TOP && !topInfo && !(await ensureTopInfo())) return;
     try {
       const data = await chrome.storage.local.get(STORE_KEY);
       const group = data[STORE_KEY] && data[STORE_KEY][pageKey()];
@@ -447,7 +469,7 @@
     items.forEach((h) => { if (!seen.has(h.id)) applyHighlight(h); });
   });
 
-  function saveRange(range, color) {
+  async function saveRange(range, color) {
     const raw = range.toString();
     const text = raw.replace(/[ \t\u00a0]+/g, ' ').replace(/\s*\n\s*/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
     if (!text) return;
@@ -467,7 +489,14 @@
     })();
     const id = genId();
     if (!wrapRange(range, id, color)) { showToast("Couldn't highlight that selection."); return; }
-    safeSend({
+    const sel = getSelection();
+    if (sel) sel.removeAllRanges();
+    hidePill();
+    // A highlight made inside an iframe belongs to the top-level page – resolve it
+    // before writing, otherwise it lands under the frame's URL and never shows up
+    // under "This page" in the popup.
+    if (!IS_TOP) await ensureTopInfo(2, 700);
+    const res = await sendToBG({
       type: 'SAVE_HIGHLIGHT',
       highlight: {
         id, url: pageKey(), pageTitle: pageTitle(),
@@ -475,20 +504,19 @@
         prefix: ctx.prefix, suffix: ctx.suffix,
       },
     });
-    const sel = getSelection();
-    if (sel) sel.removeAllRanges();
-    hidePill();
-    showToast('Saved to EchoRead');
+    if (res && res.ok) { showToast('Saved to EchoRead'); return; }
+    findMarks(id).forEach(unwrapMark); // storage refused it – don't leave a phantom mark
+    showToast(res && res.error ? `Couldn't save: ${res.error}` : "Couldn't save that highlight.");
   }
 
-  function handleContextSave(msg) {
+  async function handleContextSave(msg) {
     const sel = getSelection();
     if (sel && !sel.isCollapsed && sel.rangeCount && sel.toString().trim()) {
       return saveRange(sel.getRangeAt(0), msg.color || DEFAULT_COLOR);
     }
     const range = msg.text ? findTextRange(msg.text) : null; // selection already cleared / inside iframe
-    if (range) saveRange(range, msg.color || DEFAULT_COLOR);
-    else showToast("Couldn't locate that selection on the page.");
+    if (range) return saveRange(range, msg.color || DEFAULT_COLOR);
+    showToast("Couldn't locate that selection on the page.");
   }
 
   /* =====================================================================
@@ -530,7 +558,10 @@
     pill.addEventListener('mousedown', (e) => e.preventDefault()); // keep the page selection alive
     pill.addEventListener('click', (e) => {
       const btn = e.target.closest('button');
-      if (btn && pendingRange) saveRange(pendingRange, btn.dataset.color || DEFAULT_COLOR);
+      if (btn && pendingRange) {
+        saveRange(pendingRange, btn.dataset.color || DEFAULT_COLOR)
+          .catch(() => showToast("Couldn't highlight that selection."));
+      }
     });
     document.documentElement.appendChild(host);
     ui = { host, pill, toast: root.querySelector('.toast') };
@@ -607,7 +638,12 @@
       case 'TTS_STOP': stopReading(); sendResponse({ ok: true, state: ttsState() }); break;
       case 'TTS_SETTINGS': updateSettingsLive(msg.settings); sendResponse({ ok: true, state: ttsState() }); break;
       case 'TTS_GET_STATE': sendResponse({ ok: true, state: ttsState() }); break;
-      case 'SAVE_SELECTION': handleContextSave(msg); sendResponse({ ok: true }); break;
+      case 'BG_TTS_STOPPED':
+        if (msg.gen === tts.gen) stopReading(); // another tab took over the voice
+        break;
+      case 'SAVE_SELECTION':
+        handleContextSave(msg).then(() => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
+        return true; // async: the save only reports success once storage confirms it
       default: break;
     }
     return false;

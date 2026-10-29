@@ -104,13 +104,57 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 
 /* ---------- chrome.tts fallback ---------- */
+// chrome.tts is one global voice: remember who owns it so a second tab takes it
+// over cleanly instead of its audio queueing behind the first, and so a closed
+// tab cannot leave speech running with nobody listening.
+let speaker = null; // { tabId, gen, active }
+let keepAliveTimer = null;
+let keepAliveUntil = 0;
+
+// MV3 kills an idle worker after ~30 s. A slow sentence can outlive that, and a
+// dead worker never forwards the utterance's 'end' event, so the reader stalls.
+// A cheap API ping every 20 s resets the timer (hard-capped, so a hung utterance
+// cannot pin the worker open forever).
+function startKeepAlive() {
+  keepAliveUntil = Date.now() + 15 * 60 * 1000;
+  if (keepAliveTimer) return;
+  keepAliveTimer = setInterval(() => {
+    if (Date.now() > keepAliveUntil) { stopKeepAlive(); return; }
+    try { chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError); } catch (_) {}
+  }, 20000);
+}
+function stopKeepAlive() {
+  if (keepAliveTimer) clearInterval(keepAliveTimer);
+  keepAliveTimer = null;
+}
+
+function notifySpeakerStopped(prev) {
+  chrome.tabs
+    .sendMessage(prev.tabId, { type: 'BG_TTS_STOPPED', gen: prev.gen }, { frameId: 0 })
+    .catch(() => {});
+}
+
 function ttsSpeak(tabId, msg, useVoice) {
+  const prev = speaker;
+  speaker = { tabId, gen: msg.gen, active: true };
+  startKeepAlive();
+  if (prev && prev.tabId !== tabId && prev.active) notifySpeakerStopped(prev);
   const opts = {
     rate: Math.min(10, Math.max(0.1, Number(msg.rate) || 1)),
     pitch: Math.min(2, Math.max(0, Number(msg.pitch) || 1)),
     onEvent: (ev) => {
+      // Only the current owner's events count: a deposed utterance must not be
+      // able to advance or fail the reader it was stolen from.
+      if (!speaker || speaker.tabId !== tabId || speaker.gen !== msg.gen) return;
       // Selected voice unknown to chrome.tts → retry once with the system default.
-      if (ev.type === 'error' && useVoice && msg.voiceName) return ttsSpeak(tabId, msg, false);
+      if (ev.type === 'error' && useVoice && msg.voiceName) {
+        speaker.active = false;
+        return ttsSpeak(tabId, msg, false);
+      }
+      if (ev.type === 'end' || ev.type === 'error') {
+        speaker.active = false;
+        stopKeepAlive();
+      }
       if (['end', 'error', 'interrupted', 'cancelled'].includes(ev.type)) {
         chrome.tabs
           .sendMessage(tabId, { type: 'BG_TTS_EVENT', gen: msg.gen, event: ev.type, error: ev.errorMessage }, { frameId: 0 })
@@ -122,6 +166,15 @@ function ttsSpeak(tabId, msg, useVoice) {
   if (msg.lang) opts.lang = msg.lang;
   chrome.tts.speak(String(msg.text || '').slice(0, 3000), opts);
 }
+
+// Closing the tab the voice belongs to stops its speech outright.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (speaker && speaker.tabId === tabId) {
+    speaker = null;
+    stopKeepAlive();
+    chrome.tts.stop();
+  }
+});
 
 /* ---------- Runtime messages ---------- */
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -145,11 +198,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case 'GET_TOP_URL': {
-      // An iframe asks "what page am I on?" – answered by the top frame's content script.
+      // An iframe asks "what page am I on?" – answered by the top frame's content
+      // script. sendToTab injects it when this tab predates install/reload.
       const tabId = sender.tab && sender.tab.id;
       if (tabId == null) { sendResponse({ ok: false }); return false; }
-      chrome.tabs.sendMessage(tabId, { type: 'GET_URL' }, { frameId: 0 })
-        .then((r) => sendResponse(r || { ok: false }))
+      sendToTab(tabId, { type: 'GET_URL' }, 0)
+        .then((r) => sendResponse(r && r.ok ? r : { ok: false }))
         .catch(() => sendResponse({ ok: false }));
       return true;
     }
@@ -160,11 +214,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return false;
     }
 
-    case 'BG_TTS_CONTROL':
+    case 'BG_TTS_CONTROL': {
+      // Only the tab that owns the global voice may steer it – otherwise a deposed
+      // tab cancelling itself would stop the tab that took the voice over. With no
+      // tracked owner the audio is orphaned, so any tab may stop it.
+      const allowed = !speaker || (sender.tab && sender.tab.id === speaker.tabId);
+      if (!allowed) return false;
       if (msg.action === 'pause') chrome.tts.pause();
       else if (msg.action === 'resume') chrome.tts.resume();
-      else if (msg.action === 'stop') chrome.tts.stop();
+      else if (msg.action === 'stop') { speaker = null; stopKeepAlive(); chrome.tts.stop(); }
       return false;
+    }
 
     default:
       return false; // not ours (e.g. TTS_STATE broadcasts meant for the popup)
